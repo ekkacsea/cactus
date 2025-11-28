@@ -82,7 +82,7 @@ Example response from Gemma3-270m-INT8
 | iPhone 15 Pro | 99 | 549/74 | - | - | 0.84s | 93 | - | - | - | - |
 | Qualcomm X Elite | - | - | - | - | - | - | - | - | - | - |
 | Qualcomm X Plus | - | - | - | - | - | - | - | - | - | - |
-| Galaxy S25 Ultra | 91 | 230/63 | 173/57 | 128MB | 1.4s | 58 | - | - | - | - |
+| Galaxy S25 Ultra | 91 | 230/64 | 187/57 | 128MB | 1.3s | 70 | - | - | - | - |
 | Galaxy S24 Ultra | - | - | - | - | - | - | - | - | - | - |
 | Pixel 10 Pro | - | - | - | - | - | - | - | - | - | - |
 | Pixel 9 Pro | - | - | - | - | - | - | - | - | - | - |
@@ -105,7 +105,8 @@ cli/cactus download Qwen/Qwen3-0.6B # HF name, stored to weights/Qwen3-0.6B
 
 ## Supported models (INT8)
 
-| Model | Compressed Size | Completion | Tool Call | Vision | Embed | Speech
+| Model | Compressed Size | Completion | Tool C
+all | Vision | Embed | Speech
 |-------|--------------------|-------------------|----------------|------|------|------|
 | google/gemma-3-270m-it | 172MB  | ✓ | ✗ | ✗ | ✗ | ✗ |
 | openai/whisper-small | 210MB  | ✗ | ✗ | ✗ | ✓ | ✓ |

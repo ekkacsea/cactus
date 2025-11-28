@@ -214,7 +214,7 @@ int cactus_transcribe(
         std::vector<uint32_t> generated_tokens;
         std::string final_text;
 
-        uint32_t next_token = handle->model->generate_with_audio(tokens, mel_bins,temperature, top_p, top_k, "profile.txt");{
+        uint32_t next_token = handle->model->generate_with_audio(tokens, mel_bins,temperature, top_p, top_k);{
             auto t_first = std::chrono::high_resolution_clock::now();
             time_to_first_token = std::chrono::duration_cast<std::chrono::microseconds>(t_first - start_time).count() / 1000.0;
         }

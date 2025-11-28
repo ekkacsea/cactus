@@ -155,7 +155,7 @@ namespace CactusThreading {
         static constexpr size_t SCALAR_BASIC = 30000;
         static constexpr size_t SCALAR_EXPENSIVE = 10000;
         static constexpr size_t ATTENTION = 512;
-        static constexpr size_t GEMM_TILED = 20000; 
+        static constexpr size_t GEMM_TILED = 4096; 
         static constexpr size_t GEMM_SMALL = 64 * 64 * 64;
         static constexpr size_t GEMM_MEDIUM = 256 * 256 * 256;
         static constexpr size_t GEMM_TILE_M = 64;
