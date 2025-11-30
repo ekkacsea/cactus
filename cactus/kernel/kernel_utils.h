@@ -149,34 +149,31 @@ namespace CactusThreading {
     struct Thresholds {
 
         #if defined(__ANDROID__)
-        static constexpr size_t ELEMENT_WISE = 5000;
-        static constexpr size_t AXIS_REDUCE = 1000;
-        static constexpr size_t ALL_REDUCE = 10000;
-        static constexpr size_t SCALAR_BASIC = 30000;
-        static constexpr size_t SCALAR_EXPENSIVE = 10000;
-        static constexpr size_t ATTENTION = 512;
-        static constexpr size_t GEMM_TILED = 4096; 
-        static constexpr size_t GEMM_SMALL = 64 * 64 * 64;
-        static constexpr size_t GEMM_MEDIUM = 256 * 256 * 256;
-        static constexpr size_t GEMM_TILE_M = 64;
-        static constexpr size_t GEMM_TILE_N = 64;
-        static constexpr size_t GEMM_TILE_M_SMALL = 32;
-        static constexpr size_t GEMM_TILE_N_SMALL = 32;
-        #else // iOS
-        static constexpr size_t ELEMENT_WISE = 5000;
-        static constexpr size_t AXIS_REDUCE = 1000;
-        static constexpr size_t ALL_REDUCE = 10000;
-        static constexpr size_t SCALAR_BASIC = 5000;
-        static constexpr size_t SCALAR_EXPENSIVE = 2500;
+        static constexpr size_t PARALLEL_MIN = 4096;
+        static constexpr size_t ELEMENT_WISE = 8192;
+        static constexpr size_t AXIS_REDUCE = 2048;
+        static constexpr size_t ALL_REDUCE = 16384;
+        static constexpr size_t SCALAR_BASIC = 32768;
+        static constexpr size_t SCALAR_EXPENSIVE = 16384;
+        static constexpr size_t ATTENTION = 256;
+        static constexpr size_t GEMM_TILED = 4096;
+
+        #else
+        static constexpr size_t ELEMENT_WISE = 4096;
+        static constexpr size_t AXIS_REDUCE = 512;
+        static constexpr size_t ALL_REDUCE = 4096;
+        static constexpr size_t SCALAR_BASIC = 2048;
+        static constexpr size_t SCALAR_EXPENSIVE = 1024;
         static constexpr size_t ATTENTION = 4;
-        static constexpr size_t GEMM_TILED = 4;  
+        static constexpr size_t GEMM_TILED = 4;
+
+        #endif
         static constexpr size_t GEMM_SMALL = 64 * 64 * 64;
         static constexpr size_t GEMM_MEDIUM = 256 * 256 * 256;
         static constexpr size_t GEMM_TILE_M = 64;
         static constexpr size_t GEMM_TILE_N = 64;
         static constexpr size_t GEMM_TILE_M_SMALL = 32;
         static constexpr size_t GEMM_TILE_N_SMALL = 32;
-        #endif
         static constexpr size_t L2_CACHE_SIZE = 256 * 1024;
     };
     

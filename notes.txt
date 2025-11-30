@@ -1,0 +1,148 @@
+How llama.cpp/ggml Handles Threading (and what we can learn)
+
+  Based on my research, here's how llama.cpp structures threading for optimal performance:
+
+  1. GPU-Inspired Spinlock Model (not a thread pool)
+
+  From https://justine.lol/matmul/:
+
+  - Spawn 1 thread per CPU core at startup
+  - Threads wait at a spinlock barrier (NOT mutex/condition variables)
+  - When an operation is ready, all threads are released simultaneously
+  - Each thread knows its ID (ith) and total thread count (nth)
+  - Threads compute their portion, then return to barrier
+
+  Why spinlocks over mutex/condvar?
+  - Kernel scheduling adds latency
+  - Mutex/condvar experiments showed they're actually slower despite lower power consumption
+  - For inference, raw speed > power efficiency
+
+  2. The ith/nth Work Distribution Pattern
+
+  Instead of a task queue, work is divided statically:
+
+  // Each operation divides work like this:
+  void compute_forward_xxx(int ith, int nth, ...) {
+      int duty = (total_work + nth - 1) / nth;
+      int start = duty * ith;
+      int end = min(start + duty, total_work);
+
+      for (int i = start; i < end; i++) {
+          // do work
+      }
+  }
+
+  Or strided:
+  for (int i = ith; i < total_work; i += nth) {
+      // each thread handles every nth element
+  }
+
+  3. No Dynamic Thread Count Per Operation
+
+  Unlike your current approach that calculates optimal threads per operation, llama.cpp uses all threads for every 
+  operation. The key insight from https://github.com/ggml-org/llama.cpp/issues/2134:
+
+  "There are no futexes or semaphores... threads are restrained by a spinlock barrier and then set loose"
+
+  4. Two Thread Counts: Generation vs Batch
+
+  llama.cpp separates:
+  - n_threads - threads for token generation (often fewer is better)
+  - n_threads_batch - threads for prompt processing (more is better)
+
+  This is because:
+  - Prompt processing: Large matrices, parallelizes well
+  - Token generation: Small operations, thread overhead dominates
+
+  ---
+  Recommendations for Cactus
+
+  Option A: Simple ggml-style (recommended to try first)
+
+  class ThreadPool {
+      std::vector<std::thread> workers;
+      std::atomic<bool> ready{false};
+      std::atomic<int> barrier_count{0};
+      std::function<void(int, int)> current_work;
+      int nth;
+
+      void worker(int ith) {
+          while (!stop) {
+              // Spinlock wait for work
+              while (!ready.load(std::memory_order_acquire)) {
+                  // spin (or _mm_pause() on x86)
+              }
+
+              if (current_work) {
+                  current_work(ith, nth);
+              }
+
+              // Barrier: wait for all threads
+              barrier_count.fetch_add(1);
+              while (barrier_count.load() < nth) { /* spin */ }
+          }
+      }
+
+  public:
+      void parallel_for(auto work_func) {
+          current_work = work_func;
+          ready.store(true);
+
+          // Main thread also does work
+          work_func(0, nth);
+
+          // Wait for completion
+          while (barrier_count.load() < nth - 1) { /* spin */ }
+
+          ready.store(false);
+          barrier_count.store(0);
+      }
+  };
+
+  Option B: Hybrid approach for Android big.LITTLE
+
+  Since Android has heterogeneous cores (https://en.wikipedia.org/wiki/ARM_big.LITTLE):
+
+  // Only use "big" cores for compute
+  int get_big_core_count() {
+      // On Snapdragon 888: cores 4-7 are big/medium
+      // Parse /sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq
+      // Use cores with highest max frequency
+  }
+
+  // Pin threads to big cores
+  void pin_to_big_cores(std::thread& t, int core_id) {
+      cpu_set_t cpuset;
+      CPU_ZERO(&cpuset);
+      CPU_SET(big_core_ids[core_id], &cpuset);
+      pthread_setaffinity_np(t.native_handle(), sizeof(cpuset), &cpuset);
+  }
+
+  Option C: Keep dynamic but simplify thresholds
+
+  If you want to keep the current model, the key insight is:
+
+  inline size_t get_optimal_thread_count(size_t total_work, size_t min_work_per_thread) {
+      // Only two choices: 1 thread or all threads
+      // The middle ground rarely helps
+      if (total_work < min_work_per_thread) return 1;
+      return get_thread_pool().num_workers();
+  }
+
+  ---
+  Key Takeaways
+
+  1. Spinlock barriers > mutex/condvar for latency-sensitive inference
+  2. Static work division (ith/nth) > dynamic task queues
+  3. All-or-nothing threading often beats adaptive thread counts
+  4. Separate thread counts for batch vs generation phases
+  5. On Android: Consider only using big cores, not all 8
+
+  Would you like me to implement any of these approaches?
+
+  Sources:
+  - https://justine.lol/matmul/
+  - https://github.com/ggml-org/llama.cpp/discussions/10622
+  - https://github.com/ggml-org/llama.cpp/issues/2134
+  - https://en.wikipedia.org/wiki/ARM_big.LITTLE
+  - https://huggingface.co/blog/introduction-to-ggml

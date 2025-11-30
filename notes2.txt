@@ -1,0 +1,400 @@
+#ifndef KERNEL_UTILS_H
+#define KERNEL_UTILS_H
+
+#include <arm_neon.h>
+#include <algorithm>
+#include <cmath>
+#include <thread>
+#include <vector>
+#include <atomic>
+#include <functional>
+#include <cstdio>
+
+constexpr size_t NEON_VECTOR_SIZE = 16;
+
+inline int8_t clamp_to_int8(float value) {
+    int32_t clamped = static_cast<int32_t>(roundf(value));
+    return static_cast<int8_t>(std::max(-128, std::min(127, clamped)));
+}
+
+inline int8_t clamp_to_int8(int32_t value) {
+    return static_cast<int8_t>(std::max(-128, std::min(127, value)));
+}
+
+#if defined(__ARM_FEATURE_DOTPROD)
+inline int32x4_t accum_i8mm(int32x4_t acc, int8x16_t a, int8x16_t b) {
+    return vdotq_s32(acc, a, b);
+}
+#else
+inline int32x4_t accum_i8mm(int32x4_t acc, int8x16_t a, int8x16_t b) {
+    int16x8_t prod_low = vmull_s8(vget_low_s8(a), vget_low_s8(b));
+    int32x4_t acc_high = vpaddlq_s16(vmull_s8(vget_high_s8(a), vget_high_s8(b)));
+    return vaddq_s32(vaddq_s32(acc, vpaddlq_s16(prod_low)), acc_high);
+}
+#endif
+
+inline float16x8_t accum_f16_dot(float16x8_t acc, float16x8_t a_low, float16x8_t a_high,
+                                 float16x8_t b_low, float16x8_t b_high) {
+    acc = vfmaq_f16(acc, a_low, b_low);
+    return vfmaq_f16(acc, a_high, b_high);
+}
+
+inline float32x4_t accum_f32_dot(float32x4_t acc, float32x4_t a_low, float32x4_t a_high,
+                                  float32x4_t b_low, float32x4_t b_high) {
+    acc = vfmaq_f32(acc, a_low, b_low);
+    return vfmaq_f32(acc, a_high, b_high);
+}
+
+namespace CactusThreading {
+
+    // Spinlock barrier - ggml style
+    // All threads spin waiting for work, then execute, then spin at completion barrier
+    class SpinlockThreadPool {
+    private:
+        std::vector<std::thread> workers;
+        std::atomic<bool> stop{false};
+
+        // Work distribution
+        std::function<void(size_t, size_t)> current_work;  // (ith, nth) -> void
+        std::atomic<size_t> work_sequence{0};     // Incremented when new work arrives
+        std::atomic<size_t> complete_count{0};    // How many threads completed current work
+
+        size_t nth;  // Total thread count (including main thread)
+
+        static inline void spin_pause() {
+            #if defined(__aarch64__)
+            __asm__ __volatile__("yield" ::: "memory");
+            #else
+            __asm__ __volatile__("" ::: "memory");
+            #endif
+        }
+
+        void worker_loop(size_t ith) {
+            size_t last_sequence = 0;
+
+            while (!stop.load(std::memory_order_relaxed)) {
+                // Spin wait for new work
+                size_t current_seq = work_sequence.load(std::memory_order_acquire);
+                if (current_seq == last_sequence) {
+                    spin_pause();
+                    continue;
+                }
+
+                // New work available
+                last_sequence = current_seq;
+
+                // Check if we should stop
+                if (stop.load(std::memory_order_relaxed)) break;
+
+                // Execute work
+                if (current_work) {
+                    current_work(ith, nth);
+                }
+
+                // Signal completion
+                complete_count.fetch_add(1, std::memory_order_release);
+            }
+        }
+
+    public:
+        explicit SpinlockThreadPool(size_t num_threads = 0) {
+            if (num_threads == 0) {
+                num_threads = std::thread::hardware_concurrency();
+            }
+            nth = num_threads;
+
+            // Spawn n-1 worker threads (main thread is ith=0)
+            workers.reserve(nth - 1);
+            for (size_t i = 1; i < nth; ++i) {
+                workers.emplace_back(&SpinlockThreadPool::worker_loop, this, i);
+            }
+        }
+
+        ~SpinlockThreadPool() {
+            stop.store(true, std::memory_order_release);
+            work_sequence.fetch_add(1, std::memory_order_release);  // Wake up sleeping threads
+            for (auto& w : workers) {
+                w.join();
+            }
+        }
+
+        SpinlockThreadPool(const SpinlockThreadPool&) = delete;
+        SpinlockThreadPool& operator=(const SpinlockThreadPool&) = delete;
+
+        size_t num_workers() const { return nth; }
+
+        // Execute work across all threads using ith/nth pattern
+        // work_func receives (ith, nth) and should divide work accordingly
+        template<typename WorkFunc>
+        void run(WorkFunc&& work_func) {
+            current_work = std::forward<WorkFunc>(work_func);
+            complete_count.store(0, std::memory_order_release);
+
+            // Signal workers that new work is available
+            work_sequence.fetch_add(1, std::memory_order_release);
+
+            // Main thread does its share (ith=0)
+            current_work(0, nth);
+
+            // Wait for all workers to complete
+            while (complete_count.load(std::memory_order_acquire) < nth - 1) {
+                spin_pause();
+            }
+        }
+    };
+
+    inline SpinlockThreadPool& get_thread_pool() {
+        static SpinlockThreadPool pool;
+        return pool;
+    }
+
+    struct Thresholds {
+        #if defined(__ANDROID__)
+        // Android thresholds - tuned for big.LITTLE heterogeneous cores
+        // Higher thresholds avoid parallelizing small ops across slow LITTLE cores
+        static constexpr size_t PARALLEL_MIN = 4096;
+        static constexpr size_t ELEMENT_WISE = 8192;
+        static constexpr size_t AXIS_REDUCE = 2048;
+        static constexpr size_t ALL_REDUCE = 16384;
+        static constexpr size_t SCALAR_BASIC = 32768;
+        static constexpr size_t SCALAR_EXPENSIVE = 16384;
+        static constexpr size_t ATTENTION = 256;
+        static constexpr size_t GEMM_TILED = 8;
+        #else
+        // iOS thresholds - lower, Apple Silicon has uniform high-perf cores
+        static constexpr size_t PARALLEL_MIN = 512;
+        static constexpr size_t ELEMENT_WISE = 5000;
+        static constexpr size_t AXIS_REDUCE = 1000;
+        static constexpr size_t ALL_REDUCE = 10000;
+        static constexpr size_t SCALAR_BASIC = 5000;
+        static constexpr size_t SCALAR_EXPENSIVE = 2500;
+        static constexpr size_t ATTENTION = 4;
+        static constexpr size_t GEMM_TILED = 4;
+        #endif
+
+        // Shared GEMM tile sizes
+        static constexpr size_t GEMM_SMALL = 64 * 64 * 64;
+        static constexpr size_t GEMM_MEDIUM = 256 * 256 * 256;
+        static constexpr size_t GEMM_TILE_M = 64;
+        static constexpr size_t GEMM_TILE_N = 64;
+        static constexpr size_t GEMM_TILE_M_SMALL = 32;
+        static constexpr size_t GEMM_TILE_N_SMALL = 32;
+        static constexpr size_t L2_CACHE_SIZE = 256 * 1024;
+    };
+
+    // Main parallel_for using ith/nth pattern
+    // work_func(start, end) processes elements [start, end)
+    template<typename WorkFunc>
+    void parallel_for(size_t total_work, WorkFunc work_func) {
+        if (total_work == 0) return;
+
+        // Small work: single thread
+        if (total_work < Thresholds::PARALLEL_MIN) {
+            work_func(0, total_work);
+            return;
+        }
+
+        auto& pool = get_thread_pool();
+        pool.run([&work_func, total_work](size_t ith, size_t nth) {
+            // Static work division: each thread gets total_work/nth elements
+            size_t work_per_thread = (total_work + nth - 1) / nth;
+            size_t start = ith * work_per_thread;
+            size_t end = std::min(start + work_per_thread, total_work);
+
+            if (start < total_work) {
+                work_func(start, end);
+            }
+        });
+    }
+
+    // Overload with explicit threshold
+    template<typename WorkFunc>
+    void parallel_for(size_t total_work, size_t threshold, WorkFunc work_func) {
+        if (total_work == 0) return;
+
+        if (total_work < threshold) {
+            work_func(0, total_work);
+            return;
+        }
+
+        auto& pool = get_thread_pool();
+        pool.run([&work_func, total_work](size_t ith, size_t nth) {
+            size_t work_per_thread = (total_work + nth - 1) / nth;
+            size_t start = ith * work_per_thread;
+            size_t end = std::min(start + work_per_thread, total_work);
+
+            if (start < total_work) {
+                work_func(start, end);
+            }
+        });
+    }
+
+    // 2D parallel for (used by matmul, attention, etc.)
+    template<typename WorkFunc>
+    void parallel_for_2d(size_t outer_size, size_t inner_size, WorkFunc work_func) {
+        size_t total_work = outer_size * inner_size;
+
+        if (total_work < Thresholds::PARALLEL_MIN) {
+            for (size_t o = 0; o < outer_size; ++o) {
+                for (size_t i = 0; i < inner_size; ++i) {
+                    work_func(o, i);
+                }
+            }
+            return;
+        }
+
+        auto& pool = get_thread_pool();
+        pool.run([&work_func, outer_size, inner_size, total_work](size_t ith, size_t nth) {
+            size_t work_per_thread = (total_work + nth - 1) / nth;
+            size_t start = ith * work_per_thread;
+            size_t end = std::min(start + work_per_thread, total_work);
+
+            for (size_t work_idx = start; work_idx < end; ++work_idx) {
+                size_t outer = work_idx / inner_size;
+                size_t inner = work_idx % inner_size;
+                work_func(outer, inner);
+            }
+        });
+    }
+
+    // Overload with threshold
+    template<typename WorkFunc>
+    void parallel_for_2d(size_t outer_size, size_t inner_size, size_t threshold, WorkFunc work_func) {
+        size_t total_work = outer_size * inner_size;
+
+        if (total_work < threshold) {
+            for (size_t o = 0; o < outer_size; ++o) {
+                for (size_t i = 0; i < inner_size; ++i) {
+                    work_func(o, i);
+                }
+            }
+            return;
+        }
+
+        auto& pool = get_thread_pool();
+        pool.run([&work_func, outer_size, inner_size, total_work](size_t ith, size_t nth) {
+            size_t work_per_thread = (total_work + nth - 1) / nth;
+            size_t start = ith * work_per_thread;
+            size_t end = std::min(start + work_per_thread, total_work);
+
+            for (size_t work_idx = start; work_idx < end; ++work_idx) {
+                size_t outer = work_idx / inner_size;
+                size_t inner = work_idx % inner_size;
+                work_func(outer, inner);
+            }
+        });
+    }
+
+    // Parallel reduce
+    template<typename WorkFunc, typename ResultType, typename CombineFunc>
+    ResultType parallel_reduce(size_t total_work, WorkFunc work_func,
+                               ResultType init_value, CombineFunc combine_func) {
+        if (total_work == 0) return init_value;
+
+        if (total_work < Thresholds::PARALLEL_MIN) {
+            return work_func(0, total_work);
+        }
+
+        auto& pool = get_thread_pool();
+        size_t nth = pool.num_workers();
+        std::vector<ResultType> partial_results(nth, init_value);
+
+        pool.run([&work_func, &partial_results, total_work](size_t ith, size_t nth) {
+            size_t work_per_thread = (total_work + nth - 1) / nth;
+            size_t start = ith * work_per_thread;
+            size_t end = std::min(start + work_per_thread, total_work);
+
+            if (start < total_work) {
+                partial_results[ith] = work_func(start, end);
+            }
+        });
+
+        ResultType result = init_value;
+        for (size_t i = 0; i < nth; ++i) {
+            result = combine_func(result, partial_results[i]);
+        }
+        return result;
+    }
+
+    // Overload with threshold
+    template<typename WorkFunc, typename ResultType, typename CombineFunc>
+    ResultType parallel_reduce(size_t total_work, size_t threshold, WorkFunc work_func,
+                               ResultType init_value, CombineFunc combine_func) {
+        if (total_work == 0) return init_value;
+
+        if (total_work < threshold) {
+            return work_func(0, total_work);
+        }
+
+        auto& pool = get_thread_pool();
+        size_t nth = pool.num_workers();
+        std::vector<ResultType> partial_results(nth, init_value);
+
+        pool.run([&work_func, &partial_results, total_work](size_t ith, size_t nth) {
+            size_t work_per_thread = (total_work + nth - 1) / nth;
+            size_t start = ith * work_per_thread;
+            size_t end = std::min(start + work_per_thread, total_work);
+
+            if (start < total_work) {
+                partial_results[ith] = work_func(start, end);
+            }
+        });
+
+        ResultType result = init_value;
+        for (size_t i = 0; i < nth; ++i) {
+            result = combine_func(result, partial_results[i]);
+        }
+        return result;
+    }
+
+    // Tiled 2D parallel for (for GEMM)
+    template<typename WorkFunc>
+    void parallel_for_2d_tiled(size_t rows, size_t cols, size_t tile_rows, size_t tile_cols, WorkFunc work_func) {
+        size_t num_row_tiles = (rows + tile_rows - 1) / tile_rows;
+        size_t num_col_tiles = (cols + tile_cols - 1) / tile_cols;
+        size_t total_tiles = num_row_tiles * num_col_tiles;
+
+        if (total_tiles == 0) return;
+
+        auto& pool = get_thread_pool();
+        pool.run([&work_func, rows, cols, tile_rows, tile_cols, num_row_tiles, num_col_tiles, total_tiles](size_t ith, size_t nth) {
+            size_t tiles_per_thread = (total_tiles + nth - 1) / nth;
+            size_t start_tile = ith * tiles_per_thread;
+            size_t end_tile = std::min(start_tile + tiles_per_thread, total_tiles);
+
+            for (size_t tile_idx = start_tile; tile_idx < end_tile; ++tile_idx) {
+                size_t tile_row = tile_idx / num_col_tiles;
+                size_t tile_col = tile_idx % num_col_tiles;
+
+                size_t row_start = tile_row * tile_rows;
+                size_t row_end = std::min(row_start + tile_rows, rows);
+                size_t col_start = tile_col * tile_cols;
+                size_t col_end = std::min(col_start + tile_cols, cols);
+
+                work_func(row_start, row_end, col_start, col_end);
+            }
+        });
+    }
+
+    // Legacy compatibility functions
+    inline size_t get_optimal_thread_count(size_t total_work, size_t min_work_per_thread) {
+        if (total_work < min_work_per_thread) return 1;
+        return get_thread_pool().num_workers();
+    }
+
+    inline size_t compute_gemm_parallelism(size_t M, size_t K, size_t N, size_t element_size) {
+        (void)M; (void)K; (void)N; (void)element_size;
+        return get_thread_pool().num_workers();
+    }
+
+    // TaskHandle for backwards compatibility
+    class TaskHandle {
+    public:
+        TaskHandle(bool = true) {}
+        void wait() {}
+        bool is_ready() const { return true; }
+        size_t task_count() const { return 0; }
+    };
+}
+
+#endif // KERNEL_UTILS_H
